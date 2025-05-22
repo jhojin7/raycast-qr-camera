@@ -1,0 +1,443 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Offline QR Code Scanner with Camera Selection</title>
+    <style>
+        body {
+            font-family: sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            min-height: 100vh;
+            margin: 20px 0;
+            background-color: #f0f0f0;
+        }
+        #controls {
+            margin-bottom: 15px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            flex-wrap: wrap; /* Allow wrapping on small screens */
+            justify-content: center;
+        }
+        #camera-select-label {
+            font-weight: bold;
+        }
+        select, button {
+            padding: 10px;
+            font-size: 16px;
+            border-radius: 5px;
+            border: 1px solid #ccc;
+        }
+        button {
+            cursor: pointer;
+            background-color: #007bff;
+            color: white;
+            border: none;
+        }
+        button:hover {
+            background-color: #0056b3;
+        }
+        button:disabled {
+            background-color: #cccccc;
+            cursor: not-allowed;
+        }
+        #video-container {
+            position: relative;
+            width: 320px; /* Adjust as needed */
+            height: 240px; /* Adjust as needed */
+            border: 2px solid #333;
+            background-color: #000;
+            margin-bottom: 20px;
+        }
+        video {
+            width: 100%;
+            height: 100%;
+            display: block;
+        }
+        canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+        }
+        #output-container {
+            padding: 15px;
+            background-color: #fff;
+            border: 1px solid #ccc;
+            border-radius: 5px;
+            min-width: 300px;
+            max-width: 90%;
+            text-align: center;
+        }
+        #output-message {
+            font-weight: bold;
+            color: #333;
+        }
+        #output-data {
+            margin-top: 10px;
+            color: #007bff;
+            word-break: break-all;
+        }
+        .error {
+            color: red;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+    <h1>Offline QR Code Scanner</h1>
+
+    <div id="controls">
+        <label id="camera-select-label" for="camera-select">Camera:</label>
+        <select id="camera-select"></select>
+        <button id="start-scan-button" disabled>Start Scan</button>
+        <button id="stop-scan-button" style="display:none;">Stop Scan</button>
+    </div>
+
+    <div id="video-container">
+        <video id="video-element" playsinline autoplay></video>
+        <canvas id="canvas-element"></canvas>
+    </div>
+
+    <div id="output-container">
+        <div id="output-message">Initializing...</div>
+        <div id="output-data"></div>
+    </div>
+
+    <!-- <script src="jsQR.js"></script> -->
+    <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
+
+    <script>
+        const video = document.getElementById('video-element');
+        const canvasElement = document.getElementById('canvas-element');
+        const canvas = canvasElement.getContext('2d');
+        const outputMessage = document.getElementById('output-message');
+        const outputData = document.getElementById('output-data');
+        const startScanButton = document.getElementById('start-scan-button');
+        const stopScanButton = document.getElementById('stop-scan-button');
+        const cameraSelect = document.getElementById('camera-select');
+
+        let scanning = false;
+        let stream = null;
+        let animationFrameId = null;
+        let currentDeviceId = null; // Stores the deviceId of the camera to be used or currently in use
+        let permissionState = 'unknown'; // To store current camera permission state
+
+        // 1) Setup QR‐decode worker
+        const qrWorker = new Worker('qr-worker.js');
+        let workerBusy = false;
+        qrWorker.onmessage = (e) => {
+            workerBusy = false;
+            const code = e.data;
+            if (code) {
+                // draw bounding box
+                drawLine(code.location.topLeftCorner,     code.location.topRightCorner,    "#FF3B58");
+                drawLine(code.location.topRightCorner,    code.location.bottomRightCorner, "#FF3B58");
+                drawLine(code.location.bottomRightCorner, code.location.bottomLeftCorner,  "#FF3B58");
+                drawLine(code.location.bottomLeftCorner,  code.location.topLeftCorner,     "#FF3B58");
+                // update UI
+                if (outputData.textContent !== code.data) {
+                    outputMessage.textContent = "QR Code Found!";
+                    outputData.textContent    = code.data;
+                    outputData.classList.remove('error');
+                }
+            }
+        };
+
+        function drawLine(begin, end, color) {
+            canvas.beginPath();
+            canvas.moveTo(begin.x, begin.y);
+            canvas.lineTo(end.x, end.y);
+            canvas.lineWidth = 4;
+            canvas.strokeStyle = color;
+            canvas.stroke();
+        }
+
+        async function startCamera() {
+            const selectedDeviceId = cameraSelect.value;
+            if (!selectedDeviceId) {
+                outputMessage.textContent = "No camera selected.";
+                outputData.classList.add('error');
+                return;
+            }
+            currentDeviceId = selectedDeviceId; // Ensure currentDeviceId is up-to-date
+
+            console.log(`Attempting to start camera: ${currentDeviceId}`);
+            outputMessage.textContent = "Requesting camera access... Please check for a browser permission prompt and click 'Allow'.";
+            outputData.textContent = "";
+            outputData.classList.remove('error');
+
+            // Stop any existing stream and animation frame
+            if (stream) {
+                console.log("Stopping existing stream before starting new one.");
+                stream.getTracks().forEach(track => track.stop());
+                stream = null;
+            }
+            if (animationFrameId) {
+                cancelAnimationFrame(animationFrameId);
+                animationFrameId = null;
+            }
+            // scanning will be set to true AFTER successful getUserMedia
+
+            const constraints = {
+                video: {
+                    deviceId: { exact: currentDeviceId }
+                }
+            };
+
+            try {
+                stream = await navigator.mediaDevices.getUserMedia(constraints);
+                console.log("Camera stream acquired successfully.");
+                video.srcObject = stream;
+                video.setAttribute("playsinline", true);
+                await video.play();
+                console.log("Video playback started.");
+
+                startScanButton.style.display = 'none';
+                stopScanButton.style.display = 'inline-block';
+                cameraSelect.disabled = true;
+                outputMessage.textContent = "Scanning...";
+                scanning = true;
+                animationFrameId = requestAnimationFrame(tick);
+            } catch (err) {
+                console.error("Error accessing camera: ", err);
+                outputMessage.textContent = `Error accessing camera "${cameraSelect.options[cameraSelect.selectedIndex].text}".`;
+                outputData.textContent = `${err.name}: ${err.message}`;
+                outputData.classList.add('error');
+
+                startScanButton.style.display = 'inline-block';
+                stopScanButton.style.display = 'none';
+                cameraSelect.disabled = false;
+                scanning = false; // Ensure scanning is false if start fails
+                if (stream) { // Should be null already, but defensive
+                    stream.getTracks().forEach(track => track.stop());
+                    stream = null;
+                }
+            }
+        }
+
+        function stopCamera() {
+            console.log("Stopping camera...");
+            if (stream) {
+                stream.getTracks().forEach(track => track.stop());
+                stream = null;
+            }
+            video.srcObject = null;
+            scanning = false;
+            if (animationFrameId) {
+                cancelAnimationFrame(animationFrameId);
+                animationFrameId = null;
+            }
+            startScanButton.style.display = 'inline-block';
+            stopScanButton.style.display = 'none';
+            cameraSelect.disabled = false;
+            outputMessage.textContent = "Scan stopped. Select camera and click 'Start Scan'.";
+            canvas.clearRect(0, 0, canvasElement.width, canvasElement.height);
+            console.log("Camera stopped.");
+        }
+
+        function tick() {
+            if (!scanning || !video.srcObject || video.paused || video.ended) {
+                if (scanning && (!video.srcObject || video.ended)) {
+                    console.warn("Video stream ended unexpectedly during scan.");
+                    stopCamera();
+                    outputMessage.textContent = "Camera stream lost. Please try again.";
+                    outputData.classList.add('error');
+                }
+                return;
+            }
+
+            if (video.readyState === video.HAVE_ENOUGH_DATA) {
+                canvasElement.height = video.videoHeight;
+                canvasElement.width  = video.videoWidth;
+                canvas.drawImage(video, 0, 0, canvasElement.width, canvasElement.height);
+
+                const imageData = canvas.getImageData(0, 0, canvasElement.width, canvasElement.height);
+                if (!workerBusy) {
+                    workerBusy = true;
+                    qrWorker.postMessage({
+                        img:    imageData.data,
+                        width:  imageData.width,
+                        height: imageData.height
+                    });
+                }
+            }
+            if (scanning) {
+                animationFrameId = requestAnimationFrame(tick);
+            }
+        }
+
+        startScanButton.addEventListener('click', startCamera);
+        stopScanButton.addEventListener('click', stopCamera);
+
+        cameraSelect.addEventListener('change', async () => {
+            currentDeviceId = cameraSelect.value; // Update the desired device ID
+            console.log("Camera selection changed to:", currentDeviceId);
+            if (scanning) { // If already scanning, restart with the new camera
+                console.log("Switching camera while scanning...");
+                await startCamera(); // startCamera will handle stopping old and starting new
+            } else {
+                // If not scanning, just update the message for the next "Start Scan" click
+                if (permissionState === 'granted') {
+                    outputMessage.textContent = `Camera "${cameraSelect.options[cameraSelect.selectedIndex].text}" selected. Click 'Start Scan'.`;
+                } else if (permissionState === 'prompt') {
+                    outputMessage.textContent = `Camera "${cameraSelect.options[cameraSelect.selectedIndex].text}" selected. Click 'Start Scan', then 'Allow' browser permission.`;
+                }
+            }
+        });
+
+        async function initializeApp() {
+            console.log("Initializing application...");
+            outputMessage.textContent = "Checking camera permissions...";
+
+            if (navigator.permissions && navigator.permissions.query) {
+                try {
+                    const permissionStatus = await navigator.permissions.query({ name: 'camera' });
+                    permissionState = permissionStatus.state;
+                    console.log('Initial camera permission status:', permissionState);
+
+                    permissionStatus.onchange = async () => {
+                        permissionState = permissionStatus.state;
+                        console.log('Camera permission status changed to:', permissionState);
+                        if (permissionState === 'denied' && scanning) {
+                            stopCamera();
+                        }
+                        // Re-populate cameras as labels might become available/unavailable
+                        // or to update messages and button state.
+                        await populateCameraSelector();
+                    };
+                } catch (error) {
+                    console.warn('Could not query camera permission status:', error);
+                    permissionState = 'unknown'; // Fallback
+                }
+            } else {
+                console.warn('navigator.permissions API not supported. Proceeding with caution.');
+                permissionState = 'unknown'; // Assume we need to prompt
+            }
+
+            // If we haven’t yet been granted, trigger a permission prompt now
+            if (permissionState === 'prompt') {
+                try {
+                    const tempStream = await navigator.mediaDevices.getUserMedia({ video: true });
+                    // stop immediately—just needed to unlock labels & IDs
+                    tempStream.getTracks().forEach(t => t.stop());
+                    console.log("Temporary camera permission granted.");
+                } catch (e) {
+                    console.warn("User dismissed camera prompt or error:", e);
+                }
+            }
+
+            await populateCameraSelector(); // Populate camera list based on initial permission state
+
+            if (navigator.mediaDevices && navigator.mediaDevices.ondevicechange) {
+                navigator.mediaDevices.ondevicechange = async (event) => {
+                    console.log("Media devices changed.", event);
+                    const wasScanning = scanning;
+                    if (wasScanning) {
+                        stopCamera(); // Stop current scan if active
+                    }
+                    await populateCameraSelector(); // Re-populate the list
+
+                    // Attempt to auto-restart if it was scanning, a camera is selected, and permission is granted
+                    if (wasScanning && cameraSelect.options.length > 0 && permissionState === 'granted') {
+                        // Ensure the previously selected device (if still present) is used
+                        if (Array.from(cameraSelect.options).some(opt => opt.value === currentDeviceId)) {
+                            cameraSelect.value = currentDeviceId;
+                        } else if (cameraSelect.options.length > 0) {
+                            cameraSelect.value = cameraSelect.options[0].value; // Fallback to first
+                        }
+                        currentDeviceId = cameraSelect.value; // update currentDeviceId
+                        console.log("Attempting to auto-restart scan after device change.");
+                        await startCamera();
+                    }
+                };
+            }
+            console.log("Application initialized.");
+        }
+
+        // 3) Register Service Worker for offline caching
+        if ('serviceWorker' in navigator) {
+            navigator.serviceWorker.register('service-worker.js')
+                .then(() => console.log('Service Worker registered'))
+                .catch(err => console.warn('SW registration failed:', err));
+        }
+
+        // Populate the camera dropdown, enable/disable start button based on state
+        async function populateCameraSelector() {
+            console.log("Populating camera selector...");
+            if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) {
+                console.error("enumerateDevices() not supported.");
+                outputMessage.textContent = "Camera selection not supported by this browser.";
+                outputData.classList.add('error');
+                startScanButton.disabled = true;
+                return;
+            }
+
+            try {
+                const devices = await navigator.mediaDevices.enumerateDevices();
+                console.log("---- All Enumerated Media Devices ----");
+                devices.forEach((device, i) => {
+                    console.log(`Device ${i + 1}:`, {
+                        kind: device.kind,
+                        label: device.label,
+                        deviceId: device.deviceId,
+                        groupId: device.groupId
+                    });
+                });
+                console.log("--------------------------------------");
+
+                const videoInputDevices = devices.filter(d => d.kind === 'videoinput' && d.deviceId !== '');
+                const oldValue = cameraSelect.value;
+                cameraSelect.innerHTML = '';
+
+                if (videoInputDevices.length === 0) {
+                    outputMessage.textContent = "No cameras found.";
+                    outputData.classList.add('error');
+                    startScanButton.disabled = true;
+                    console.warn("No video input devices found.");
+                    return;
+                }
+
+                videoInputDevices.forEach((device, idx) => {
+                    const opt = document.createElement('option');
+                    opt.value = device.deviceId;
+                    opt.text = device.label || `Camera ${idx + 1} (ID: ${device.deviceId.substring(0,8)}...)`;
+                    cameraSelect.appendChild(opt);
+                });
+
+                // restore or default selection
+                if (oldValue && videoInputDevices.some(d => d.deviceId === oldValue)) {
+                    cameraSelect.value = oldValue;
+                } else {
+                    cameraSelect.value = videoInputDevices[0].deviceId;
+                }
+                currentDeviceId = cameraSelect.value;
+
+                if (permissionState === 'denied') {
+                    outputMessage.textContent = "Camera permission denied. Please check browser settings.";
+                    startScanButton.disabled = true;
+                } else if (permissionState === 'prompt') {
+                    outputMessage.textContent = "Click 'Start Scan', then 'Allow' camera access in browser prompt.";
+                    startScanButton.disabled = false;
+                } else {
+                    outputMessage.textContent = "Select a camera and click 'Start Scan'.";
+                    startScanButton.disabled = false;
+                }
+                console.log("Camera selector populated. Start button enabled:", !startScanButton.disabled);
+            } catch (err) {
+                console.error("Error enumerating devices:", err);
+                outputMessage.textContent = "Error listing cameras.";
+                outputData.textContent = err.message;
+                outputData.classList.add('error');
+                startScanButton.disabled = true;
+            }
+        }
+
+        document.addEventListener('DOMContentLoaded', initializeApp);
+    </script>
+</body>
+</html>

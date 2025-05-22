@@ -1,0 +1,4 @@
+/*
+  /* apply to all routes */
+  Permissions-Policy: camera=(self)
+*/
